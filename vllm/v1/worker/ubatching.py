@@ -15,6 +15,18 @@ _THREAD_ID_TO_CONTEXT: dict = {}
 # Here we hardcode the number of microbatches to 2 for default.
 _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
+# How often a microbatch waiting for its turn re-checks whether a sibling
+# microbatch has failed. Only reached when the handoff does not arrive.
+_ABORT_POLL_INTERVAL_S = 0.1
+
+
+class UBatchAborted(RuntimeError):
+    """Raised inside a microbatch when a sibling microbatch has failed.
+
+    Microbatches hand control to each other, so a thread that dies leaves the
+    others waiting for a handoff that will never come. Waking them with
+    `abort_event` set unwinds them instead of hanging the step.
+    """
 
 
 class UBatchContext:
@@ -33,9 +45,11 @@ class UBatchContext:
         cpu_signal_event: threading.Event,
         gpu_comm_done_event: torch.Event,
         gpu_compute_done_event: torch.Event,
+        abort_event: threading.Event,
         schedule: str = "default",
     ):
         self.id = id
+        self.abort_event = abort_event
         self.comm_stream = comm_stream
         self.compute_stream = compute_stream
         self.forward_context = forward_context
@@ -91,7 +105,14 @@ class UBatchContext:
     def _wait_comm_done(self):
         self.compute_stream.wait_event(self.gpu_comm_done_event)
 
+    def _check_aborted(self):
+        if self.abort_event.is_set():
+            raise UBatchAborted(
+                f"Microbatch {self.id} aborted: a sibling microbatch failed"
+            )
+
     def _cpu_yield(self):
+        self._check_aborted()
         # It is critical for correctness that only one thread is running
         # at a time. These asserts just make sure that this is the only
         # thread running before waking the other one up and going to sleep
@@ -100,8 +121,13 @@ class UBatchContext:
         assert not self.cpu_wait_event.is_set()
 
         self.cpu_signal_event.set()
-        self.cpu_wait_event.wait()
+        # Wait in steps rather than indefinitely: a sibling microbatch that
+        # dies never makes the handoff, and its wake-up can be lost to the
+        # clear() below if it lands while this thread is between the two.
+        while not self.cpu_wait_event.wait(timeout=_ABORT_POLL_INTERVAL_S):
+            self._check_aborted()
         self.cpu_wait_event.clear()
+        self._check_aborted()
         self._restore_context()
 
     def switch_to_comm(self):
@@ -221,6 +247,9 @@ def make_ubatch_contexts(
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]
     gpu_compute_done_events = [torch.Event() for _ in range(num_micro_batches)]
+    # Shared by all the microbatches: set it (and wake the waiters) to unwind
+    # the ones still running after another has failed.
+    abort_event = threading.Event()
 
     ctxs = []
     for i in range(num_micro_batches):
@@ -234,6 +263,7 @@ def make_ubatch_contexts(
             cpu_signal_event=cpu_events[(i + 1) % num_micro_batches],
             gpu_comm_done_event=gpu_comm_done_events[i],
             gpu_compute_done_event=gpu_compute_done_events[i],
+            abort_event=abort_event,
             schedule=schedule,
         )
         ctxs.append(ctx)
