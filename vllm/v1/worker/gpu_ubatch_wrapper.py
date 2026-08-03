@@ -26,9 +26,53 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.deep_gemm import set_num_sms as deep_gemm_set_num_sms
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.platform_utils import num_compute_units
-from vllm.v1.worker.ubatching import UBatchContext, make_ubatch_contexts
+from vllm.v1.worker.ubatching import UBatchAborted, UBatchContext, make_ubatch_contexts
 
 logger = init_logger(__name__)
+
+# Exceptions raised as a consequence of another microbatch failing, rather than
+# by the microbatch that actually broke. Never reported as the root cause.
+_UBATCH_SECONDARY_ERRORS = (UBatchAborted, threading.BrokenBarrierError)
+
+
+def _run_ubatch_guarded(
+    ctx: UBatchContext,
+    contexts: list[UBatchContext],
+    errors: dict[int, BaseException],
+    ready_barrier: threading.Barrier,
+    body: Callable[[], None],
+) -> None:
+    """Run one microbatch, unwinding its siblings if it fails.
+
+    Microbatches hand control to each other, so a thread that dies leaves the
+    others waiting for a handoff that will never come. Record the failure, set
+    the shared abort flag so parked siblings raise `UBatchAborted` instead of
+    blocking forever, and break the barrier in case one has not reached it yet.
+    """
+    try:
+        body()
+    except BaseException as e:  # noqa: BLE001
+        errors[ctx.id] = e
+        ctx.abort_event.set()
+        # A sibling may still be short of the barrier, and the main thread is
+        # waiting on it too. Break it so nobody waits for a thread that died.
+        ready_barrier.abort()
+        # Wake whoever is already parked. The abort flag is what they act on;
+        # this is only so they notice without waiting out the poll interval.
+        for other in contexts:
+            if other is not ctx:
+                other.cpu_wait_event.set()
+
+
+def _raise_ubatch_error(errors: dict[int, BaseException], num_ubatches: int):
+    """Re-raise the microbatch failure that caused the step to fail."""
+    root_causes = [
+        i for i, e in errors.items() if not isinstance(e, _UBATCH_SECONDARY_ERRORS)
+    ]
+    failed = min(root_causes) if root_causes else min(errors)
+    raise RuntimeError(f"Microbatch {failed} of {num_ubatches} failed") from errors[
+        failed
+    ]
 
 
 def _cat_ubatch_outputs(
@@ -232,27 +276,39 @@ class UBatchWrapper:
         and returns
         """
 
+        contexts = [m.context for m in ubatch_metadata]
+        errors: dict[int, BaseException] = {}
+
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):
-            torch.accelerator.set_device_index(self.device)
             ubatch_context = ubatch_metadata.context
-            with torch.cuda.stream(ubatch_context.compute_stream):
-                _ = torch.cuda.current_blas_handle()
-            with torch.cuda.stream(ubatch_context.comm_stream):
-                _ = torch.cuda.current_blas_handle()
-            with ubatch_context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
 
-            results.append((ubatch_metadata.context.id, model_output))
+            def _body():
+                torch.accelerator.set_device_index(self.device)
+                with torch.cuda.stream(ubatch_context.compute_stream):
+                    _ = torch.cuda.current_blas_handle()
+                with torch.cuda.stream(ubatch_context.comm_stream):
+                    _ = torch.cuda.current_blas_handle()
+                with ubatch_context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
+
+                results.append((ubatch_metadata.context.id, model_output))
+
+            _run_ubatch_guarded(
+                ubatch_context, contexts, errors, self.ready_barrier, _body
+            )
 
         results: list[tuple[int, torch.Tensor]] = []
         compute_stream = ubatch_metadata[0].context.compute_stream
         num_tokens = sum(m.num_tokens for m in ubatch_metadata)
+
+        # Clear any broken state left by a previous capture that aborted.
+        self.ready_barrier.reset()
 
         # Ubatches will manually manage the forward context, so we override
         # it to None here so we can have it restored correctly later
@@ -268,7 +324,15 @@ class UBatchWrapper:
                 )
                 ubatch_threads.append(thread)
                 thread.start()
-            self.ready_barrier.wait()  # Wait for all ubatch threads to be ready
+            try:
+                # Wait for all ubatch threads to be ready
+                self.ready_barrier.wait()
+            except threading.BrokenBarrierError:
+                # A ubatch thread died before reaching the barrier. Join the
+                # siblings and report, without opening a graph capture.
+                for thread in ubatch_threads:
+                    thread.join()
+                _raise_ubatch_error(errors, len(ubatch_metadata))
 
             # Capture the cudagraph
             cudagraph_metadata = CUDAGraphMetaData(
@@ -292,6 +356,11 @@ class UBatchWrapper:
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:
                     thread.join()
+                if errors:
+                    # Bail out before touching the partial results. The capture
+                    # is already invalid; ending it may raise a second, less
+                    # useful error, which keeps this one as its __context__.
+                    _raise_ubatch_error(errors, len(ubatch_metadata))
                 sorted_results = [value for position, value in sorted(results)]
                 result = _cat_ubatch_outputs(sorted_results)
                 cudagraph_metadata.outputs = result
@@ -303,18 +372,29 @@ class UBatchWrapper:
         return cudagraph_metadata.outputs
 
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
+        contexts = [m.context for m in ubatch_metadata]
+        errors: dict[int, BaseException] = {}
+
         @torch.inference_mode()
         def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
-            results.append((ubatch_metadata.context.id, model_output))
+            def _body():
+                with ubatch_metadata.context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
+                results.append((ubatch_metadata.context.id, model_output))
+
+            _run_ubatch_guarded(
+                ubatch_metadata.context, contexts, errors, self.ready_barrier, _body
+            )
 
         results: list[tuple[int, torch.Tensor]] = []
+
+        # Clear any broken state left by a previous step that aborted.
+        self.ready_barrier.reset()
 
         # Ubatch threads will manually manage the forward context, so we
         # override it to None here so we can have it restored correctly
@@ -332,10 +412,21 @@ class UBatchWrapper:
                 )
                 ubatch_threads.append(thread)
                 thread.start()
-            self.ready_barrier.wait()  # Wait for all ubatch threads to be ready
-            ubatch_metadata[0].context.cpu_wait_event.set()
+            try:
+                # Wait for all ubatch threads to be ready
+                self.ready_barrier.wait()
+            except threading.BrokenBarrierError:
+                # A ubatch thread died before reaching the barrier. Its
+                # siblings are unwinding; join them and report below.
+                pass
+            else:
+                ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
                 thread.join()
+
+        if errors:
+            _raise_ubatch_error(errors, len(ubatch_metadata))
+
         sorted_results = [value for position, value in sorted(results)]
         result = _cat_ubatch_outputs(sorted_results)
         return result

@@ -66,24 +66,30 @@ class UBatchContext:
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
         _CURRENT_CONTEXTS[self.id] = self
-        # _NUM_UBATCHES is set in make_ubatch_contexts
-        self.ready_barrier.wait()
-
-        self.cpu_wait_event.wait()
-        self.cpu_wait_event.clear()
-        self._restore_context()
+        try:
+            # _NUM_UBATCHES is set in make_ubatch_contexts
+            self.ready_barrier.wait()
+            self._wait_for_turn()
+        except BaseException:
+            # Never entered, so __exit__ will not run. Undo the registration
+            # here or this dead thread's id keeps `dbo_enabled()` true.
+            self._deregister()
+            raise
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
-        _CURRENT_CONTEXTS[self.id] = None
-        del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+        self._deregister()
         self.maybe_run_recv_hook()
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
+
+    def _deregister(self):
+        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
+        _CURRENT_CONTEXTS[self.id] = None
+        _THREAD_ID_TO_CONTEXT.pop(threading.get_ident(), None)
 
     def _restore_context(self):
         forward_context._forward_context = self.forward_context
@@ -111,6 +117,22 @@ class UBatchContext:
                 f"Microbatch {self.id} aborted: a sibling microbatch failed"
             )
 
+    def _wait_for_turn(self):
+        """Block until a sibling hands over control, or until one fails.
+
+        Waits in steps rather than indefinitely: a sibling that dies never
+        makes the handoff, and even the wake-up it sends while unwinding can
+        be lost to the `clear()` below if it lands between the wait returning
+        and the clear. `abort_event` is sticky, so polling it is what actually
+        guarantees this returns; the wake-up only makes it prompt.
+        """
+        self._check_aborted()
+        while not self.cpu_wait_event.wait(timeout=_ABORT_POLL_INTERVAL_S):
+            self._check_aborted()
+        self.cpu_wait_event.clear()
+        self._check_aborted()
+        self._restore_context()
+
     def _cpu_yield(self):
         self._check_aborted()
         # It is critical for correctness that only one thread is running
@@ -121,14 +143,7 @@ class UBatchContext:
         assert not self.cpu_wait_event.is_set()
 
         self.cpu_signal_event.set()
-        # Wait in steps rather than indefinitely: a sibling microbatch that
-        # dies never makes the handoff, and its wake-up can be lost to the
-        # clear() below if it lands while this thread is between the two.
-        while not self.cpu_wait_event.wait(timeout=_ABORT_POLL_INTERVAL_S):
-            self._check_aborted()
-        self.cpu_wait_event.clear()
-        self._check_aborted()
-        self._restore_context()
+        self._wait_for_turn()
 
     def switch_to_comm(self):
         self.update_stream(self.comm_stream)
