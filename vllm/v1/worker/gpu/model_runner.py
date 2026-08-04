@@ -126,7 +126,11 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
-from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner, slice_input_batch
+from vllm.v1.worker.gpu.ubatch_utils import (
+    UBatchRunner,
+    create_even_ubatch_slices,
+    slice_input_batch,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import UBatchSlices, maybe_create_ubatch_slices
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
@@ -430,8 +434,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.parallel_config.use_ubatching and self.dp_size > 1:
             self.ubatch_runner = UBatchRunner(self.vllm_config, self.device)
             logger.info_once(
-                "Dual batch overlap is enabled. Microbatched steps run without "
-                "CUDA graphs on the V2 model runner."
+                "Dual batch overlap is enabled. Uniform decode steps above the "
+                "microbatching threshold replay a microbatched FULL CUDA graph; "
+                "other microbatched steps run eager."
             )
 
     def get_model(self) -> nn.Module:
@@ -815,6 +820,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                 lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                ubatch_runner=self.ubatch_runner,
             )
             if self.speculator is not None:
                 self.speculator.capture()
@@ -1172,22 +1178,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         block_tables: tuple[torch.Tensor, ...],
         slot_mappings: torch.Tensor,
-        num_ubatches: int,
+        batch_desc: BatchExecutionDescriptor,
     ) -> "UBatchState":
         """Split the batch and build attention metadata per microbatch.
 
         The split point is the midpoint of the (DP-padded) token count, which
         all ranks agree on because they run the same number of tokens whenever
         microbatching is active.
+
+        Replaying a captured graph additionally requires the request boundary
+        to sit where it did at capture time, so there the split comes from the
+        padded shape rather than from the batch contents.
         """
-        _, ubatch_slices = maybe_create_ubatch_slices(
-            True,
-            input_batch.num_scheduled_tokens,
-            input_batch.num_tokens_after_padding,
-            input_batch.num_reqs_after_padding,
-            num_ubatches,
-        )
-        assert ubatch_slices is not None
+        num_ubatches = batch_desc.num_ubatches
+        cg_mode = batch_desc.cg_mode
+        if cg_mode == CUDAGraphMode.FULL:
+            ubatch_slices = create_even_ubatch_slices(
+                input_batch.num_tokens_after_padding,
+                input_batch.num_reqs_after_padding,
+                num_ubatches,
+            )
+        else:
+            _, ubatch_slices = maybe_create_ubatch_slices(
+                True,
+                input_batch.num_scheduled_tokens,
+                input_batch.num_tokens_after_padding,
+                input_batch.num_reqs_after_padding,
+                num_ubatches,
+            )
+            assert ubatch_slices is not None
 
         attn_metadata = []
         slot_mappings_by_layer = []
@@ -1201,7 +1220,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_metadata.append(
                 self.model_state.prepare_attn(
                     ubatch,
-                    CUDAGraphMode.NONE,
+                    cg_mode,
                     ubatch_block_tables,
                     ubatch_slot_mappings,
                     self.attn_groups,
@@ -1407,7 +1426,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_ubatches > 1:
             assert slot_mappings is not None and block_tables is not None
             ubatch_state = self._prepare_ubatches(
-                input_batch, block_tables, slot_mappings, batch_desc.num_ubatches
+                input_batch, block_tables, slot_mappings, batch_desc
             )
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
@@ -1490,7 +1509,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
-        if ubatch_state is not None:
+        if ubatch_state is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # Replay the microbatched graph. Like the single-batch FULL path,
+            # the inputs are already in the buffers the graph captured; the
+            # per-microbatch metadata built above re-planned the attention
+            # backends into those same buffers.
+            assert self.cudagraph_manager is not None
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=input_batch.num_tokens_after_padding,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices=ubatch_state.slices,
+            ):
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+        elif ubatch_state is not None:
             assert self.ubatch_runner is not None
             forward_contexts = self.ubatch_runner.make_forward_contexts(
                 ubatch_state.attn_metadata,

@@ -54,8 +54,19 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
+    synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
+
     ubatch_desc = _maybe_ubatch_descriptor(
-        num_tokens_across_dp, wants_ubatch_across_dp, num_reqs, num_ubatches
+        num_tokens_across_dp,
+        wants_ubatch_across_dp,
+        num_reqs,
+        num_ubatches,
+        # If any rank has to run eager, no rank may replay a graph.
+        cudagraph_manager=(
+            cudagraph_manager if synced_cg_mode != CUDAGraphMode.NONE else None
+        ),
+        uniform_token_count=_synced_uniform_token_count(uniform_token_counts_across_dp),
+        num_active_loras=num_active_loras,
     )
     if ubatch_desc is not None:
         # Microbatching needs every rank to run the same number of tokens, so
@@ -64,8 +75,6 @@ def sync_cudagraph_and_dp_padding(
             num_tokens_across_dp, ubatch_desc.num_tokens
         )
         return ubatch_desc, num_tokens_across_dp
-
-    synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
 
     # If any rank wants to run eager, all ranks run eager
     if synced_cg_mode == CUDAGraphMode.NONE:
@@ -81,12 +90,9 @@ def sync_cudagraph_and_dp_padding(
         "where synced_cg_mode must be NONE across all DP ranks"
     )
     synced_num_tokens = int(num_tokens_across_dp.max().item())
-    synced_uniform_token_count = uniform_token_counts_across_dp[0]
-    # If ranks disagree on the uniform token count, or its 0 (means None) set to None
-    if synced_uniform_token_count == 0 or not torch.all(
-        uniform_token_counts_across_dp == synced_uniform_token_count
-    ):
-        synced_uniform_token_count = None
+    synced_uniform_token_count = _synced_uniform_token_count(
+        uniform_token_counts_across_dp
+    )
 
     # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
     # so we don't perform request padding for PIECEWISE graphs.
@@ -104,43 +110,71 @@ def sync_cudagraph_and_dp_padding(
     return synced_desc, num_tokens_across_dp
 
 
+def _synced_uniform_token_count(
+    uniform_token_counts_across_dp: torch.Tensor,
+) -> int | None:
+    """The token count per request, if every rank has the same uniform one."""
+    count = uniform_token_counts_across_dp[0]
+    # If ranks disagree on the uniform token count, or its 0 (means None) set to None
+    if count == 0 or not torch.all(uniform_token_counts_across_dp == count):
+        return None
+    return int(count)
+
+
 def _maybe_ubatch_descriptor(
     num_tokens_across_dp: torch.Tensor,
     wants_ubatch_across_dp: torch.Tensor,
     num_reqs: int,
     num_ubatches: int,
+    cudagraph_manager: CudaGraphManager | None = None,
+    uniform_token_count: int | None = None,
+    num_active_loras: int = 0,
 ) -> BatchExecutionDescriptor | None:
     """Decide whether the group microbatches this step, and at what size.
 
     Microbatching is all-or-nothing: every rank has to split, because the
     expert all-to-all is collective. Returns the descriptor all ranks will run,
     or None to fall through to the regular (single batch) path.
+
+    Every input this decides on is either synchronized across the ranks or
+    (`num_reqs`) only used for padding this rank's own batch, so all ranks
+    reach the same conclusion without a second all-reduce.
     """
     if num_ubatches <= 1 or not torch.all(wants_ubatch_across_dp == 1).item():
         return None
 
     # Every rank runs the largest rank's token count, so pad up to it.
     num_tokens = int(num_tokens_across_dp.max().item())
-    if is_last_ubatch_empty(
-        int(num_tokens_across_dp.min().item()), num_tokens, num_ubatches
-    ):
-        # The smallest rank has too few tokens to fill every microbatch.
-        logger.debug(
-            "Skipping microbatching: %d tokens do not fill %d microbatches of %d",
-            int(num_tokens_across_dp.min().item()),
-            num_ubatches,
-            num_tokens,
-        )
-        return None
-
-    # Microbatched steps run eager for now; no CUDA graphs are captured for
-    # them yet, so there is nothing to dispatch to.
-    return BatchExecutionDescriptor(
+    desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.NONE,
         num_tokens=num_tokens,
         num_reqs=num_reqs,
         num_ubatches=num_ubatches,
     )
+    if cudagraph_manager is not None:
+        # A microbatched graph pads the batch further, up to its capture size.
+        desc = cudagraph_manager.dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras=num_active_loras,
+            num_ubatches=num_ubatches,
+        )
+
+    if is_last_ubatch_empty(
+        int(num_tokens_across_dp.min().item()), desc.num_tokens, num_ubatches
+    ):
+        # The smallest rank has too few tokens to fill every microbatch. Note
+        # this is checked against the padded size: padding up to a capture size
+        # can empty out the trailing microbatch on its own.
+        logger.debug(
+            "Skipping microbatching: %d tokens do not fill %d microbatches of %d",
+            int(num_tokens_across_dp.min().item()),
+            num_ubatches,
+            desc.num_tokens,
+        )
+        return None
+    return desc
 
 
 def dispatch_cg_and_sync_dp(

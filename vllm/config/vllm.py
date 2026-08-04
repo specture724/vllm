@@ -2281,15 +2281,7 @@ class VllmConfig:
         if model_config is not None and model_config.is_hybrid:
             unsupported.append("dual batch overlap with hybrid models")
 
-        if unsupported:
-            return unsupported
-
-        if envs.VLLM_USE_V2_MODEL_RUNNER is None:
-            # Microbatched steps do not use CUDA graphs on V2 yet, so the V1
-            # runner stays the default for DBO. Setting VLLM_USE_V2_MODEL_RUNNER
-            # explicitly opts in to the V2 implementation.
-            return ["dual batch overlap"]
-        return []
+        return unsupported
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""

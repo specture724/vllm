@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 from itertools import product
 from typing import Any, NamedTuple, Protocol
 
@@ -35,6 +36,12 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.ubatch_utils import (
+    UBatchRunner,
+    create_even_ubatch_slices,
+    slice_input_batch,
+)
+from vllm.v1.worker.ubatch_utils import UBatchSlices, check_ubatch_thresholds
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -43,6 +50,14 @@ logger = init_logger(__name__)
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
+
+
+class UBatchAttentionState(NamedTuple):
+    """`AttentionState` per microbatch, plus their padding masks."""
+
+    attn_metadata: list[dict[str, Any]]
+    slot_mappings_by_layer: list[dict[str, torch.Tensor]]
+    is_padding: list[torch.Tensor | None]
 
 
 @dataclass(frozen=True)
@@ -127,8 +142,16 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
 
+        self.parallel_config = vllm_config.parallel_config
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # Microbatched (DBO) graphs are captured in addition to the plain ones,
+        # so a step that ends up not microbatching still finds a graph.
+        self.num_ubatches = (
+            self.parallel_config.num_ubatches
+            if self.parallel_config.use_ubatching
+            else 1
+        )
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
         self.lora_capture_cases = lora_capture_cases or [0]
@@ -178,6 +201,29 @@ class CudaGraphManager:
             return num_active_loras
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
+
+    def _can_capture_ubatched(self, desc: BatchExecutionDescriptor) -> bool:
+        """Whether a microbatched graph is worth capturing for this shape.
+
+        Microbatched graphs are limited to FULL uniform-decode shapes: the
+        microbatch boundary has to sit at the same request *and* token index on
+        every replay, which only lines up with the runtime split when every
+        request contributes the same number of tokens (see
+        `create_even_ubatch_slices`). Sizes below the DBO threshold are skipped
+        because `UBatchRunner.wants_ubatch` would never ask for them.
+        """
+        return (
+            self.num_ubatches > 1
+            # DBO is all-or-nothing across DP ranks, so it needs a DP group.
+            and self.dp_size > 1
+            and desc.cg_mode == CUDAGraphMode.FULL
+            and desc.num_reqs is not None
+            and desc.num_tokens % self.num_ubatches == 0
+            and desc.num_reqs % self.num_ubatches == 0
+            and check_ubatch_thresholds(
+                self.parallel_config, desc.num_tokens, uniform_decode=True
+            )
+        )
 
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
@@ -257,6 +303,13 @@ class CudaGraphManager:
                             (rounded_num_tokens, num_active_loras)
                         ].append(desc)
 
+                        if self._can_capture_ubatched(desc):
+                            ubatch_desc = replace(desc, num_ubatches=self.num_ubatches)
+                            descs_by_mode[decode_mode].append(ubatch_desc)
+                            descs_by_token_lora[
+                                (rounded_num_tokens, num_active_loras)
+                            ].append(ubatch_desc)
+
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed, so we leave it as None.
@@ -313,6 +366,10 @@ class CudaGraphManager:
                 metadata during warmup.
         """
         with graph_capture(device=self.device):
+            # The microbatch threads run on the stream that is current here, so
+            # their graphs have to be captured on it rather than on the side
+            # stream `torch.cuda.graph` would pick.
+            ubatch_stream = torch.cuda.current_stream()
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -356,7 +413,10 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        capture_stream = (
+                            ubatch_stream if desc.num_ubatches > 1 else None
+                        )
+                        with torch.cuda.graph(graph, self.pool, capture_stream):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -462,6 +522,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
+        ubatch_runner: UBatchRunner | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
@@ -497,6 +558,20 @@ class ModelCudaGraphManager(CudaGraphManager):
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+
+            if desc.num_ubatches > 1:
+                assert ubatch_runner is not None
+                return self._create_ubatch_forward_fn(
+                    desc,
+                    model,
+                    model_state,
+                    model_inputs,
+                    input_buffers,
+                    block_tables,
+                    attn_groups,
+                    kv_cache_config,
+                    ubatch_runner,
+                )
 
             attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
@@ -542,36 +617,104 @@ class ModelCudaGraphManager(CudaGraphManager):
                     # model outputs. No need to keep track of the hidden states.
                     return None
 
-                if self.is_last_pp_rank:
-                    # Last PP rank (common case).
-                    if self.use_aux_hidden_state_outputs:
-                        hidden_states, aux_hidden_states = model_output
-                    else:
-                        hidden_states = model_output
-                        aux_hidden_states = []
-                    if self.hidden_states is None:
-                        self.hidden_states = torch.empty_like(hidden_states)
-                    self.hidden_states[:num_tokens] = hidden_states
-                    if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
-                        self.aux_hidden_states = [
-                            torch.empty_like(x) for x in aux_hidden_states
-                        ]
-                    for i, aux in enumerate(aux_hidden_states):
-                        self.aux_hidden_states[i][:num_tokens] = aux
-                else:
-                    # Non-last PP rank.
-                    assert isinstance(model_output, IntermediateTensors)
-                    intermediate_tensors = model_output
-                    if self.intermediate_tensors is None:
-                        self.intermediate_tensors = IntermediateTensors.empty_like(
-                            intermediate_tensors
-                        )
-                    for k, v in intermediate_tensors.tensors.items():
-                        self.intermediate_tensors[k][:num_tokens] = v
+                self._store_output(model_output, num_tokens)
 
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+
+    def _store_output(self, model_output: Any, num_tokens: int) -> None:
+        """Copy the model output into the buffers `run_fullgraph` reads back."""
+        if self.is_last_pp_rank:
+            # Last PP rank (common case).
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+            else:
+                hidden_states = model_output
+                aux_hidden_states = []
+            if self.hidden_states is None:
+                self.hidden_states = torch.empty_like(hidden_states)
+            self.hidden_states[:num_tokens] = hidden_states
+            if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
+                self.aux_hidden_states = [
+                    torch.empty_like(x) for x in aux_hidden_states
+                ]
+            for i, aux in enumerate(aux_hidden_states):
+                self.aux_hidden_states[i][:num_tokens] = aux
+        else:
+            # Non-last PP rank.
+            assert isinstance(model_output, IntermediateTensors)
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = IntermediateTensors.empty_like(model_output)
+            for k, v in model_output.tensors.items():
+                self.intermediate_tensors[k][:num_tokens] = v
+
+    def _create_ubatch_forward_fn(
+        self,
+        desc: BatchExecutionDescriptor,
+        model: nn.Module,
+        model_state: ModelState,
+        model_inputs: dict[str, Any],
+        input_buffers: InputBuffers,
+        block_tables: BlockTables,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        ubatch_runner: UBatchRunner,
+    ) -> Callable[[CUDAGraphMode], None]:
+        """Prepare a microbatched forward pass for warmup or capture.
+
+        The microbatch threads are started here, before the caller opens the
+        CUDA graph, and park until the returned function runs them; see
+        `UBatchRunner.launch`. That function must be called exactly once, since
+        it also joins the threads.
+        """
+        assert desc.num_reqs is not None
+        num_tokens = desc.num_tokens
+        ubatch_slices = create_even_ubatch_slices(
+            num_tokens, desc.num_reqs, desc.num_ubatches
+        )
+        ubatch_state = prepare_ubatch_inputs_to_capture(
+            desc.num_reqs,
+            num_tokens,
+            ubatch_slices,
+            model_state,
+            input_buffers,
+            block_tables,
+            attn_groups,
+            kv_cache_config,
+        )
+
+        # Capture with dummy rows marked as padding.
+        input_buffers.is_padding.fill_(True)
+
+        forward_contexts = ubatch_runner.make_forward_contexts(
+            ubatch_state.attn_metadata,
+            ubatch_state.slot_mappings_by_layer,
+            ubatch_slices,
+            ubatch_state.is_padding,
+        )
+
+        stack = ExitStack()
+        finish = stack.enter_context(
+            ubatch_runner.launch(
+                model,
+                model_inputs,
+                forward_contexts,
+                ubatch_slices,
+                compute_stream=torch.cuda.current_stream(),
+                for_capture=True,
+            )
+        )
+
+        def forward_fn(cg_mode: CUDAGraphMode) -> None:
+            assert cg_mode != CUDAGraphMode.PIECEWISE, (
+                "Microbatched steps do not use piecewise cudagraphs"
+            )
+            with stack:
+                model_output = finish()
+            self._store_output(model_output, num_tokens)
+
+        return forward_fn
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
@@ -651,3 +794,48 @@ def prepare_inputs_to_capture(
         for_capture=full_cudagraph,
     )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
+
+
+def prepare_ubatch_inputs_to_capture(
+    num_reqs: int,
+    num_tokens: int,
+    ubatch_slices: UBatchSlices,
+    model_state: ModelState,
+    input_buffers: InputBuffers,
+    block_tables: BlockTables,
+    attn_groups: list[list[AttentionGroup]],
+    kv_cache_config: KVCacheConfig,
+) -> "UBatchAttentionState":
+    """Build the per-microbatch attention state a microbatched graph captures.
+
+    Mirrors `prepare_inputs_to_capture`, except the dummy batch is sliced the
+    same way `GPUModelRunner._prepare_ubatches` slices a real one, so the graph
+    records the buffer addresses each microbatch will use on replay.
+    """
+    input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+    input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+
+    attn_metadata = []
+    slot_mappings_by_layer = []
+    is_padding = []
+    for i, ubatch_slice in enumerate(ubatch_slices):
+        ubatch = slice_input_batch(input_batch, ubatch_slice, i, input_buffers)
+        ubatch_slot_mappings = slot_mappings[:, ubatch_slice.token_slice]
+        attn_metadata.append(
+            model_state.prepare_attn(
+                ubatch,
+                CUDAGraphMode.FULL,
+                tuple(bt[ubatch_slice.request_slice] for bt in input_block_tables),
+                ubatch_slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture=True,
+                ubatch_idx=i,
+            )
+        )
+        slot_mappings_by_layer.append(
+            build_slot_mappings_by_layer(ubatch_slot_mappings, kv_cache_config)
+        )
+        is_padding.append(ubatch.is_padding)
+    return UBatchAttentionState(attn_metadata, slot_mappings_by_layer, is_padding)

@@ -3,6 +3,8 @@
 """Microbatching (DBO) helpers for the V2 GPU model runner."""
 
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any
 
@@ -29,6 +31,34 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.ubatching import make_ubatch_contexts
 
 logger = init_logger(__name__)
+
+
+def create_even_ubatch_slices(
+    num_tokens_padded: int, num_reqs_padded: int, num_ubatches: int
+) -> UBatchSlices:
+    """Split the batch into equal token *and* request ranges.
+
+    CUDA graphs replay the addresses they captured, so a microbatch has to
+    cover the same slice of every input buffer on every replay. Deriving the
+    request boundary from the batch contents (as `maybe_create_ubatch_slices`
+    does) makes it move with the number of scheduled requests, so instead the
+    boundary is pinned to the padded shape the graph was captured for.
+
+    This only describes the same microbatches as the content-derived split when
+    every request has the same query length, which is why microbatched graphs
+    are captured for uniform decode batches only.
+    """
+    assert num_tokens_padded % num_ubatches == 0
+    assert num_reqs_padded % num_ubatches == 0
+    tokens_per_ubatch = num_tokens_padded // num_ubatches
+    reqs_per_ubatch = num_reqs_padded // num_ubatches
+    return [
+        UBatchSlice(
+            request_slice=slice(i * reqs_per_ubatch, (i + 1) * reqs_per_ubatch),
+            token_slice=slice(i * tokens_per_ubatch, (i + 1) * tokens_per_ubatch),
+        )
+        for i in range(num_ubatches)
+    ]
 
 
 def slice_input_batch(
@@ -298,19 +328,31 @@ class UBatchRunner:
             )
         return forward_contexts
 
-    def run(
+    @contextmanager
+    def launch(
         self,
         model: Any,
         model_inputs: dict[str, Any],
         forward_contexts: list[ForwardContext],
         ubatch_slices: UBatchSlices,
-    ) -> Any:
+        compute_stream: torch.cuda.Stream | None = None,
+        for_capture: bool = False,
+    ) -> Iterator[Callable[[], Any]]:
+        """Start the microbatch threads and yield the call that runs them.
+
+        The threads are started, initialize their CUDA state and park on the
+        barrier before this yields; the yielded callable then wakes the first
+        one and joins them all, returning the merged output. Splitting it that
+        way lets the caller capture a CUDA graph around the model execution
+        alone: everything the threads do before the handoff starts (creating
+        cuBLAS handles, allocating thread state) happens outside the capture.
+        """
         assert len(forward_contexts) == len(ubatch_slices) == self.num_ubatches
 
         ubatch_contexts = make_ubatch_contexts(
             num_micro_batches=self.num_ubatches,
             comm_stream=self.comm_stream,
-            compute_stream=current_stream(),
+            compute_stream=compute_stream or current_stream(),
             forward_contexts=forward_contexts,
             ready_barrier=self.ready_barrier,
         )
@@ -321,6 +363,14 @@ class UBatchRunner:
         @torch.inference_mode()
         def run_ubatch(ubatch_context, inputs: dict[str, Any]) -> None:
             try:
+                torch.cuda.set_device(self.device)
+                if for_capture:
+                    # Create the thread's cuBLAS handles before the barrier, so
+                    # they are never created under CUDA graph capture.
+                    with torch.cuda.stream(ubatch_context.compute_stream):
+                        torch.cuda.current_blas_handle()
+                    with torch.cuda.stream(ubatch_context.comm_stream):
+                        torch.cuda.current_blas_handle()
                 with ubatch_context:
                     outputs[ubatch_context.id] = model(**inputs)
             except BaseException as e:  # noqa: BLE001
@@ -332,6 +382,19 @@ class UBatchRunner:
                 # changing the shared handoff protocol in ubatching.py, which
                 # is deliberately out of scope here.
                 errors[ubatch_context.id] = e
+
+        def finish() -> Any:
+            # Wake the first microbatch; from here the threads hand off to each
+            # other until all of them are done.
+            ubatch_contexts[0].cpu_wait_event.set()
+            for thread in threads:
+                thread.join()
+            if errors:
+                failed = min(errors)
+                raise RuntimeError(
+                    f"Microbatch {failed} of {self.num_ubatches} failed"
+                ) from errors[failed]
+            return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
 
         # The threads manage the forward context themselves; clear it here so
         # it is restored correctly once they are done.
@@ -348,15 +411,26 @@ class UBatchRunner:
                 threads.append(thread)
                 thread.start()
 
-            # Wait for every thread to reach its context, then start the first.
+            # Returns once every thread has parked on its context.
             self.ready_barrier.wait()
-            ubatch_contexts[0].cpu_wait_event.set()
-            for thread in threads:
-                thread.join()
+            try:
+                yield finish
+            finally:
+                if any(thread.is_alive() for thread in threads):
+                    # The caller raised before running the microbatches; release
+                    # them so they don't outlive the step.
+                    ubatch_contexts[0].cpu_wait_event.set()
+                    for thread in threads:
+                        thread.join()
 
-        if errors:
-            failed = min(errors)
-            raise RuntimeError(
-                f"Microbatch {failed} of {self.num_ubatches} failed"
-            ) from errors[failed]
-        return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
+    def run(
+        self,
+        model: Any,
+        model_inputs: dict[str, Any],
+        forward_contexts: list[ForwardContext],
+        ubatch_slices: UBatchSlices,
+    ) -> Any:
+        with self.launch(
+            model, model_inputs, forward_contexts, ubatch_slices
+        ) as finish:
+            return finish()

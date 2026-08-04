@@ -18,11 +18,17 @@ import torch
 
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import create_forward_context
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
+    CudaGraphManager,
+)
 from vllm.v1.worker.gpu.dp_utils import _maybe_ubatch_descriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
+    create_even_ubatch_slices,
     slice_input_batch,
     slice_model_inputs,
 )
@@ -219,7 +225,11 @@ def test_trailing_microbatch_absorbs_cudagraph_padding():
 
 
 def _ubatch_descriptor(
-    num_tokens_per_rank: list[int], wants_ubatch: list[int], num_ubatches: int = 2
+    num_tokens_per_rank: list[int],
+    wants_ubatch: list[int],
+    num_ubatches: int = 2,
+    cudagraph_manager=None,
+    uniform_token_count: int | None = None,
 ):
     # `_maybe_ubatch_descriptor` is the decision the DP all-reduce feeds; it is
     # tested directly so the cases below don't need a process group.
@@ -228,6 +238,8 @@ def _ubatch_descriptor(
         torch.tensor(wants_ubatch, dtype=torch.int32),
         num_reqs=8,
         num_ubatches=num_ubatches,
+        cudagraph_manager=cudagraph_manager,
+        uniform_token_count=uniform_token_count,
     )
 
 
@@ -257,6 +269,168 @@ def test_microbatching_skipped_when_a_rank_cannot_fill_it():
 
 def test_microbatching_off_when_not_configured():
     assert _ubatch_descriptor([256, 256], [1, 1], num_ubatches=1) is None
+
+
+def _cudagraph_manager(
+    descs: list[BatchExecutionDescriptor], captured: bool = True
+) -> CudaGraphManager:
+    """A manager holding `descs` as its captured graphs.
+
+    Built field by field: a real one needs a process group and a CUDA graph
+    pool, and none of the dispatch path under test touches either.
+    """
+    manager = CudaGraphManager.__new__(CudaGraphManager)
+    manager._graphs_captured = captured
+    manager._lora_dispatch_map, manager._max_lora_case = {}, 0
+    manager._candidates = {}
+    for desc in descs:
+        for num_tokens in range(desc.num_tokens + 1):
+            manager._candidates.setdefault((num_tokens, 0), []).append(desc)
+    return manager
+
+
+def _decode_desc(num_tokens: int, num_ubatches: int = 1) -> BatchExecutionDescriptor:
+    return BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=num_tokens,
+        num_reqs=num_tokens,
+        uniform_token_count=1,
+        num_ubatches=num_ubatches,
+    )
+
+
+def test_microbatched_step_replays_its_own_cudagraph():
+    """A microbatched step dispatches to a graph captured for microbatching."""
+    manager = _cudagraph_manager([_decode_desc(256), _decode_desc(256, num_ubatches=2)])
+
+    desc = _ubatch_descriptor(
+        [200, 250], [1, 1], cudagraph_manager=manager, uniform_token_count=1
+    )
+    assert desc is not None
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.num_ubatches == 2
+    # Padded up to the capture size, past the largest rank's 250 tokens.
+    assert desc.num_tokens == 256
+
+    # A non-microbatched batch of the same shape must not land on that graph.
+    plain = manager.dispatch(250, 250, 1, num_active_loras=0)
+    assert plain.num_ubatches == 1
+    assert plain.cg_mode == CUDAGraphMode.FULL
+
+
+def test_microbatched_step_runs_eager_without_a_matching_graph():
+    """Mixed batches have no microbatched graph, so they fall back to eager."""
+    manager = _cudagraph_manager([_decode_desc(256, num_ubatches=2)])
+
+    # uniform_token_count=None marks a mixed prefill/decode batch.
+    desc = _ubatch_descriptor(
+        [200, 250], [1, 1], cudagraph_manager=manager, uniform_token_count=None
+    )
+    assert desc is not None
+    assert desc.cg_mode == CUDAGraphMode.NONE
+    assert desc.num_ubatches == 2
+    assert desc.num_tokens == 250
+
+
+def test_microbatching_skipped_when_cudagraph_padding_empties_it():
+    """Padding up to a capture size can empty the trailing microbatch."""
+    manager = _cudagraph_manager(
+        [_decode_desc(128, num_ubatches=2), _decode_desc(256, num_ubatches=2)]
+    )
+
+    # The batch is padded to 256 for the busiest rank, splitting at 128. The
+    # quiet rank's 120 real tokens all land in the first microbatch, so the
+    # group gives up on microbatching rather than run an empty one.
+    assert (
+        _ubatch_descriptor(
+            [120, 250], [1, 1], cudagraph_manager=manager, uniform_token_count=1
+        )
+        is None
+    )
+    # The same ranks do microbatch when they fit a smaller capture size.
+    desc = _ubatch_descriptor(
+        [120, 128], [1, 1], cudagraph_manager=manager, uniform_token_count=1
+    )
+    assert desc is not None and desc.num_tokens == 128
+
+
+def _can_capture_ubatched(
+    desc: BatchExecutionDescriptor,
+    dp_size: int = 2,
+    num_ubatches: int = 2,
+    decode_threshold: int = 32,
+) -> bool:
+    manager = CudaGraphManager.__new__(CudaGraphManager)
+    manager.dp_size = dp_size
+    manager.num_ubatches = num_ubatches
+    manager.parallel_config = ParallelConfig(
+        enable_dbo=True,
+        all2all_backend="deepep_low_latency",
+        dbo_decode_token_threshold=decode_threshold,
+    )
+    return manager._can_capture_ubatched(desc)
+
+
+def test_microbatched_graphs_captured_for_splittable_decode_shapes():
+    assert _can_capture_ubatched(_decode_desc(64))
+    # Below the DBO threshold no step would ask to microbatch.
+    assert not _can_capture_ubatched(_decode_desc(16))
+    # Without a DP group there is nobody to agree to microbatch with.
+    assert not _can_capture_ubatched(_decode_desc(64), dp_size=1)
+    # Piecewise graphs cannot be microbatched.
+    assert not _can_capture_ubatched(
+        replace(_decode_desc(64), cg_mode=CUDAGraphMode.PIECEWISE)
+    )
+    # An odd shape has no even split.
+    assert not _can_capture_ubatched(
+        replace(_decode_desc(64), num_tokens=63, num_reqs=63)
+    )
+    assert not _can_capture_ubatched(replace(_decode_desc(64), num_reqs=33))
+
+
+def test_even_slices_match_the_content_split_for_uniform_decode():
+    """The fixed split a graph replays is the split a padded decode gets anyway.
+
+    Microbatched graphs pin the request boundary to the padded shape so it
+    survives replay. For the uniform decode batches they are captured for, that
+    has to describe the same microbatches as slicing by batch content.
+    """
+    num_reqs_padded, num_tokens_padded = 16, 16
+    # 12 real decodes padded out to the capture size; both microbatches still
+    # hold real tokens, which is what the DP handshake guarantees.
+    num_scheduled_tokens = np.ones(12, dtype=np.int32)
+
+    _, content_slices = maybe_create_ubatch_slices(
+        True,
+        num_scheduled_tokens,
+        num_tokens_padded,
+        num_reqs_padded,
+        num_ubatches=2,
+    )
+    even_slices = create_even_ubatch_slices(num_tokens_padded, num_reqs_padded, 2)
+    assert even_slices == content_slices
+
+
+def test_even_split_keeps_padded_requests_empty():
+    """Padded rows in a microbatch decode nothing, whatever the split."""
+    query_lens, seq_lens = [1] * 5, [64, 72, 80, 88, 96]
+    buffers = _make_buffers()
+    input_batch = _make_input_batch(
+        query_lens, seq_lens, buffers, num_reqs_padded=8, num_tokens_padded=8
+    )
+
+    slices = create_even_ubatch_slices(8, 8, 2)
+    last = slice_input_batch(input_batch, slices[-1], 1, buffers)
+
+    # One real decode (the 5th request) followed by three padded rows.
+    assert last.num_reqs == 1
+    assert last.num_tokens == 1
+    torch.testing.assert_close(
+        last.query_start_loc, torch.tensor([0, 1, 1, 1, 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        last.seq_lens, torch.tensor([96, 0, 0, 0], dtype=torch.int32)
+    )
 
 
 def test_slice_model_inputs_handles_mrope_positions():
@@ -327,6 +501,83 @@ def test_ubatch_runner_overlaps_and_matches_single_batch():
 
     # Both microbatches reach the handoff before either finishes.
     assert trace == [("enter", 0), ("enter", 1), ("exit", 0), ("exit", 1)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_microbatched_forward_replays_as_a_cudagraph():
+    """A microbatched forward can be captured and replayed on new inputs.
+
+    This is what `ModelCudaGraphManager` does for a microbatched descriptor:
+    the threads are started outside the capture, the handoff between them is
+    recorded as graph edges, and the replay reads whatever the persistent input
+    buffers hold.
+    """
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model="facebook/opt-125m", dtype="float16", seed=0),
+        parallel_config=ParallelConfig(
+            enable_dbo=True, all2all_backend="deepep_low_latency"
+        ),
+    )
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    runner = UBatchRunner(vllm_config, device)
+
+    num_tokens = 16
+    weight = torch.randn(8, 8, device=device)
+
+    class _MatmulModel(torch.nn.Module):
+        """Yields mid-forward and runs a cuBLAS op in each microbatch."""
+
+        def forward(self, input_ids, positions, **kwargs):
+            x = input_ids.float().unsqueeze(-1) * torch.ones(1, 8, device=device)
+            x = x @ weight
+            dbo_yield()
+            return x + positions.float().unsqueeze(-1)
+
+    # Persistent buffers, as the model runner keeps them.
+    input_ids = torch.arange(num_tokens, device=device)
+    positions = torch.arange(num_tokens, device=device)
+    model_inputs = {
+        "input_ids": input_ids,
+        "positions": positions,
+        "inputs_embeds": None,
+        "intermediate_tensors": None,
+    }
+    ubatch_slices = create_even_ubatch_slices(num_tokens, num_tokens, 2)
+    model = _MatmulModel()
+
+    def expected() -> torch.Tensor:
+        x = input_ids.float().unsqueeze(-1) * torch.ones(1, 8, device=device)
+        return x @ weight + positions.float().unsqueeze(-1)
+
+    def launch():
+        return runner.launch(
+            model,
+            model_inputs,
+            [create_forward_context(None, vllm_config) for _ in range(2)],
+            ubatch_slices,
+            compute_stream=capture_stream,
+            for_capture=True,
+        )
+
+    capture_stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(capture_stream):
+        # Warmup pass, then capture, as the cudagraph manager does.
+        with launch() as finish:
+            torch.testing.assert_close(finish(), expected())
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with launch() as finish, torch.cuda.graph(graph, None, capture_stream):
+            captured_output = finish()
+    torch.cuda.synchronize()
+
+    input_ids.copy_(torch.randint(0, 100, (num_tokens,), device=device))
+    positions.copy_(torch.randint(0, 100, (num_tokens,), device=device))
+    want = expected()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_output, want)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
