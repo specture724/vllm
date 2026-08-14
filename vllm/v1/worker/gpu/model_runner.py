@@ -1625,32 +1625,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_start()
 
         # Run model.
-        if ubatch_state is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Replay a captured DBO graph. `ubatch_runner.prepare()` above
-            # already wrote this step's real query_start_loc/seq_lens into the
-            # persistent per-microbatch buffers the graph reads from, so
-            # replay needs nothing further from `ubatch_state` -- same as the
-            # non-ubatched FULL branch below, just dispatched through a
-            # `num_ubatches > 1` descriptor.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        elif ubatch_state is not None:
-            assert self.ubatch_runner is not None
-            with self.ubatch_runner.forward_context(ubatch_state, num_tokens_across_dp):
-                self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.ubatch_runner.run(
-                    self.model, model_inputs, ubatch_state
-                )
-        elif batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # Replay a captured FULL graph, microbatched or not: the prepare
+            # step above already staged this step's inputs into the persistent
+            # buffers the graph reads from (`ubatch_runner.prepare()` rebases
+            # the per-microbatch query_start_loc/seq_lens the same way), and
+            # the descriptor's num_ubatches picked which graph was captured.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
-            # For piecewise and eager mode, just call model().
+            # Eager and PIECEWISE, split or not. A split step passes the same
+            # context args with attn_metadata/slot_mapping still None (its
+            # metadata lives in the per-microbatch contexts built by
+            # `ubatch_runner.prepare()`); this outer context only covers the
+            # KV connector, since `ubatch_runner.run()` clears it and the
+            # microbatch threads install their own.
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
@@ -1667,9 +1659,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                ubatch_slices=ubatch_state.slices if ubatch_state else None,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                if ubatch_state is not None:
+                    assert self.ubatch_runner is not None
+                    model_output = self.ubatch_runner.run(
+                        self.model, model_inputs, ubatch_state
+                    )
+                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
