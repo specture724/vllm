@@ -20,6 +20,8 @@ with FlashInfer and with Triton/FLA on CUDA, allowing prefills to cross cache
 boundaries in one step. Triton checkpoint offsets must be multiples of 64.
 All Mamba layers must support checkpoints; otherwise the scheduler splits the
 prefill. An unsplit prefill can delay other requests' decode steps.
+Triton reads and updates recurrent state directly in the cache and writes its
+checkpoint there; the shared exporter still supplies the convolution window.
 
 With prefix caching enabled, Mamba state is stored only on the Mamba block grid, so a prefix-cache hit can resume only at a block boundary. `--enable-mamba-shared-prefix-checkpoint` also stores a checkpoint at the shared-prefix junction, the point where an earlier request with the same prefix stopped. Requests whose shared prefix ends inside a block can then reuse it.
 

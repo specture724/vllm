@@ -924,9 +924,11 @@ def test_mamba_prefix_cache_mrv2_async_flashinfer(monkeypatch: pytest.MonkeyPatc
     ),
     reason="FlashInfer GDN prefill needs SM90, or SM100/SM120 with CUDA 13.",
 )
+@pytest.mark.parametrize("backend", ["flashinfer", "triton"])
 @create_new_process_for_each_test()
 def test_mamba_mid_block_resume_exports_into_resumed_block(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ):
     """A partial hit resuming mid-block whose prompt ends in the next block
     prefills in one step, exporting the checkpoint into the resumed block.
@@ -1010,7 +1012,7 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
         enable_prefix_caching=True,
         block_size=B,
         prefix_match_unit=64,
-        additional_config={"gdn_prefill_backend": "flashinfer"},
+        additional_config={"gdn_prefill_backend": backend},
         max_num_batched_tokens=3072,
         max_model_len=B * 4,
         # Layer 3 is full attention: a single (GDN-only) KV cache group only
