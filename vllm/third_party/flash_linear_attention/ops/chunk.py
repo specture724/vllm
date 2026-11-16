@@ -10,7 +10,7 @@
 
 import torch
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from .chunk_delta_h import PagedState, chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
@@ -35,6 +35,7 @@ def chunk_gated_delta_rule_fwd(
     core_attn_out: torch.Tensor | None = None,
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
+    state_io: PagedState | None = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -72,6 +73,7 @@ def chunk_gated_delta_rule_fwd(
         chunk_offsets=chunk_offsets,
         checkpoint_state=checkpoint_state,
         checkpoint_offsets=checkpoint_offsets,
+        state_io=state_io,
     )
     o = chunk_fwd_o(
         q=q,
@@ -111,6 +113,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         core_attn_out: torch.Tensor | None = None,
         checkpoint_state: torch.Tensor | None = None,
         checkpoint_offsets: torch.Tensor | None = None,
+        state_io: PagedState | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -131,6 +134,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             core_attn_out=core_attn_out,
             checkpoint_state=checkpoint_state,
             checkpoint_offsets=checkpoint_offsets,
+            state_io=state_io,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -159,6 +163,7 @@ def chunk_gated_delta_rule(
     core_attn_out: torch.Tensor | None = None,
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
+    state_io: PagedState | None = None,
 ):
     r"""
     Args:
@@ -190,6 +195,11 @@ def chunk_gated_delta_rule(
         checkpoint_offsets (Optional[torch.Tensor]):
             Token offsets of shape `[N]`, `0` for none. Only multiples of the 64-token
             chunk below the sequence length are stored.
+        state_io (Optional[PagedState]):
+            Inference-only pool and row mapping for in-place state I/O.
+            Replaces `initial_state`, `output_final_state` and `checkpoint_state`;
+            final states are written to the pool and the returned final state is None.
+            Checkpoint offsets retain their existing meaning.
     Returns:
         o (torch.Tensor):
             Outputs of shape `[B, T, H, V]`.
@@ -241,7 +251,11 @@ def chunk_gated_delta_rule(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
             )
-    if (checkpoint_state is None) != (checkpoint_offsets is None):
+    if state_io is not None and (
+        initial_state is not None or output_final_state or checkpoint_state is not None
+    ):
+        raise ValueError("state_io replaces dense initial/final/checkpoint buffers")
+    if state_io is None and (checkpoint_state is None) != (checkpoint_offsets is None):
         raise ValueError("checkpoint_state and checkpoint_offsets go together")
     if checkpoint_state is not None:
         N = q.shape[0] if cu_seqlens is None else len(cu_seqlens) - 1
@@ -277,5 +291,6 @@ def chunk_gated_delta_rule(
         core_attn_out,
         checkpoint_state,
         checkpoint_offsets,
+        state_io,
     )
     return o, final_state
